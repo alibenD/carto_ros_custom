@@ -12,6 +12,17 @@
    See the License for the specific language governing permissions and
    limitations under the License.
 
+VN Instruction
+---------------
+
+**所有定制修改均在xx_maintain分支。**
+
+- 运行offline建图及Landmark提取。脚本在`vn_cartographer_ros/cartographer_ros/scripts`
+
+```
+e.g. $ ./run_carto_customized.bash ROS_BAG_PATH
+```
+
 ============================
 Cartographer ROS Integration
 ============================

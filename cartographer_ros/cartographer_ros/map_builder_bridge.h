@@ -86,6 +86,7 @@ class MapBuilderBridge {
   visualization_msgs::MarkerArray GetConstraintList();
 
   SensorBridge* sensor_bridge(int trajectory_id);
+  int build_traj_id_;
 
  private:
   void OnLocalSlamResult(
@@ -100,7 +101,9 @@ class MapBuilderBridge {
   const NodeOptions node_options_;
   std::unordered_map<int, std::shared_ptr<const TrajectoryState::LocalSlamData>>
       trajectory_state_data_ GUARDED_BY(mutex_);
+  public:
   std::unique_ptr<cartographer::mapping::MapBuilderInterface> map_builder_;
+  private:
   tf2_ros::Buffer* const tf_buffer_;
 
   std::unordered_map<std::string /* landmark ID */, int> landmark_to_index_;

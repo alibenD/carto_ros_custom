@@ -22,15 +22,21 @@
 #include <time.h>
 #include <chrono>
 
+#include "cartographer/common/mutex.h"
 #include "cartographer_ros/node.h"
 #include "cartographer_ros/playable_bag.h"
 #include "cartographer_ros/split_string.h"
 #include "cartographer_ros/urdf_reader.h"
+#include "cartographer_ros/msg_conversion.h"
+#include "cartographer_ros/time_conversion.h"
 #include "gflags/gflags.h"
 #include "ros/callback_queue.h"
 #include "rosgraph_msgs/Clock.h"
 #include "tf2_ros/static_transform_broadcaster.h"
 #include "urdf/model.h"
+#include "visualization_msgs/Marker.h"
+#include "visualization_msgs/MarkerArray.h"
+#include "tf/transform_listener.h"
 
 DEFINE_string(configuration_directory, "",
               "First directory in which configuration files are searched, "
@@ -52,7 +58,7 @@ DEFINE_string(urdf_filenames, "",
               "static links for the sensor configuration(s).");
 DEFINE_bool(use_bag_transforms, true,
             "Whether to read, use and republish transforms from bags.");
-DEFINE_string(load_state_filename, "",
+DEFINE_string(load_state_filename, "/home/aliben/cartographer_data/amcl/localization_3.bag.fixed_odom.bag.pbstream",
               "If non-empty, filename of a .pbstream file to load, containing "
               "a saved SLAM state.");
 DEFINE_bool(load_frozen_state, true,
@@ -63,6 +69,12 @@ DEFINE_bool(keep_running, false,
 DEFINE_double(skip_seconds, 0,
               "Optional amount of seconds to skip from the beginning "
               "(i.e. when the earliest bag starts.). ");
+
+DEFINE_string(save_filename, "raw_landmarks_data",
+              "If empty, filename of a poster landmarks file to save.");
+
+DEFINE_bool(GL, false,
+            "generate landmark");
 
 namespace cartographer_ros {
 
@@ -110,6 +122,7 @@ void RunOfflineNode(const MapBuilderFactory& map_builder_factory) {
   // transform. When we finish processing the bag, we will simply drop any
   // remaining sensor data that cannot be transformed due to missing transforms.
   node_options.lookup_transform_timeout_sec = 0.;
+  node_options.generate_landmark = FLAGS_GL;
 
   auto map_builder = map_builder_factory(node_options.map_builder_options);
 
@@ -280,6 +293,12 @@ void RunOfflineNode(const MapBuilderFactory& map_builder_factory) {
     if (it != bag_topic_to_sensor_id.end()) {
       const std::string& sensor_id = it->second.id;
       if (msg.isType<sensor_msgs::LaserScan>()) {
+
+        auto ptr_msg = msg.instantiate<sensor_msgs::LaserScan>();
+        {
+          cartographer::common::MutexLocker lock(&node.mutex_pl_);
+          node.latest_pl_ = ToPointCloudWithIntensities(*ptr_msg);
+        }
         node.HandleLaserScanMessage(trajectory_id, sensor_id,
                                     msg.instantiate<sensor_msgs::LaserScan>());
       }
@@ -315,6 +334,8 @@ void RunOfflineNode(const MapBuilderFactory& map_builder_factory) {
     clock_publisher.publish(clock);
 
     if (is_last_message_in_bag) {
+
+      node.saveLandmarks(FLAGS_save_filename);
       node.FinishTrajectory(trajectory_id);
     }
   }

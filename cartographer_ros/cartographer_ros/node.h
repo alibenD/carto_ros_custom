@@ -114,7 +114,16 @@ class Node {
   // Loads a serialized SLAM state from a .pbstream file.
   void LoadState(const std::string& state_filename, bool load_frozen_state);
 
+  void saveLandmarks(const std::string& save_path);
+
   ::ros::NodeHandle* node_handle();
+  ::ros::Publisher point_cloud_compare_publisher_;
+  ::ros::Publisher landmarks_point_cloud_publisher_;
+  ::ros::Publisher landmarks_point_cloud_history_publisher_;
+  ::ros::Publisher landmarks_point_cloud_global_history_publisher_;
+  std::vector<std::pair<size_t, std::vector<Eigen::Vector3f>>> landmark_local_;
+  std::vector<std::tuple<size_t, ::ros::Time, std::vector<Eigen::Vector3f>>> landmark_local_with_time_;
+
 
  private:
   struct Subscriber {
@@ -160,16 +169,28 @@ class Node {
   bool ValidateTrajectoryOptions(const TrajectoryOptions& options);
   bool ValidateTopicNames(const ::cartographer_ros_msgs::SensorTopics& topics,
                           const TrajectoryOptions& options);
+  bool InitVisualization();
   cartographer_ros_msgs::StatusResponse FinishTrajectoryUnderLock(
       int trajectory_id) REQUIRES(mutex_);
 
+public:
   const NodeOptions node_options_;
+  std::tuple<::cartographer::sensor::PointCloudWithIntensities, ::cartographer::common::Time> latest_pl_;
+  std::vector<std::tuple<::cartographer::sensor::PointCloudWithIntensities, ::cartographer::common::Time>> buff_pl_;
+  cartographer::common::Mutex mutex_pl_;
+
+  ::visualization_msgs::Marker current_landmark_array_;
+  ::visualization_msgs::Marker history_landmark_array_;
+  ::visualization_msgs::Marker history_global_landmark_array_;
+
+private:
 
   tf2_ros::TransformBroadcaster tf_broadcaster_;
 
+public:
   cartographer::common::Mutex mutex_;
   MapBuilderBridge map_builder_bridge_ GUARDED_BY(mutex_);
-
+private:
   ::ros::NodeHandle node_handle_;
   ::ros::Publisher submap_list_publisher_;
   ::ros::Publisher trajectory_node_list_publisher_;

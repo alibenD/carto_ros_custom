@@ -15,6 +15,7 @@
 cmake_minimum_required(VERSION 2.8.12)  # Ships with Ubuntu 14.04 (Trusty)
 
 project(cartographer_ros)
+add_compile_options(-std=c++14)
 
 set(PACKAGE_DEPENDENCIES
   cartographer_ros_msgs
@@ -82,7 +83,7 @@ catkin_package(
   LIBRARIES ${PROJECT_NAME}
 )
 
-file(GLOB_RECURSE ALL_SRCS "*.cc" "*.h")
+file(GLOB_RECURSE ALL_SRCS "*.cc" "*.h" "*.hh")
 file(GLOB_RECURSE ALL_TESTS "*_test.cc")
 file(GLOB_RECURSE ALL_EXECUTABLES "*_main.cc")
 file(GLOB_RECURSE ALL_GRPC_FILES "cartographer_ros/cartographer_grpc/*")

@@ -19,6 +19,7 @@
 #include <chrono>
 #include <string>
 #include <vector>
+#include <fstream>
 
 #include "Eigen/Core"
 #include "cartographer/common/configuration_file_resolver.h"
@@ -41,6 +42,7 @@
 #include "ros/serialization.h"
 #include "sensor_msgs/PointCloud2.h"
 #include "tf2_eigen/tf2_eigen.h"
+#include "tf/transform_listener.h"
 #include "visualization_msgs/MarkerArray.h"
 
 namespace cartographer_ros {
@@ -109,10 +111,29 @@ Node::Node(
       kFinishTrajectoryServiceName, &Node::HandleFinishTrajectory, this));
   service_servers_.push_back(node_handle_.advertiseService(
       kWriteStateServiceName, &Node::HandleWriteState, this));
+  InitVisualization();
 
   scan_matched_point_cloud_publisher_ =
       node_handle_.advertise<sensor_msgs::PointCloud2>(
           kScanMatchedPointCloudTopic, kLatestOnlyPublisherQueueSize);
+
+
+  landmarks_point_cloud_publisher_ =
+      node_handle_.advertise<visualization_msgs::Marker>(
+          "Landmarks", 1);
+
+  landmarks_point_cloud_history_publisher_ =
+      node_handle_.advertise<visualization_msgs::Marker>(
+          "LandmarksHistory", 1);
+
+  landmarks_point_cloud_global_history_publisher_ =
+      node_handle_.advertise<visualization_msgs::Marker>(
+          "LandmarksHistoryGlobal", 1);
+
+//          landmark_local_.reserve(10000);
+          landmark_local_with_time_.reserve(10000);
+
+  point_cloud_compare_publisher_ = node_handle_.advertise<sensor_msgs::PointCloud2>("Compara_Scan", 1);
 
   wall_timers_.push_back(node_handle_.createWallTimer(
       ::ros::WallDuration(node_options_.submap_publish_period_sec),
@@ -140,6 +161,42 @@ bool Node::HandleSubmapQuery(
     ::cartographer_ros_msgs::SubmapQuery::Response& response) {
   carto::common::MutexLocker lock(&mutex_);
   map_builder_bridge_.HandleSubmapQuery(request, response);
+  return true;
+}
+
+bool Node::InitVisualization() {
+  current_landmark_array_.ns = "current_frame_landmarks";
+  current_landmark_array_.header.frame_id = "map";
+  current_landmark_array_.action = visualization_msgs::Marker::ADD;
+  current_landmark_array_.type = visualization_msgs::Marker::LINE_LIST;
+  current_landmark_array_.id = 1;
+  current_landmark_array_.color.r = 0.6;
+  current_landmark_array_.color.g = 0.3;
+  current_landmark_array_.color.b = 0.0;
+  current_landmark_array_.color.a = 1.0;
+  current_landmark_array_.scale.x = 0.01;
+
+  history_landmark_array_.ns = "history_frame_landmarks";
+  history_landmark_array_.header.frame_id = "map";
+  history_landmark_array_.action = visualization_msgs::Marker::ADD;
+  history_landmark_array_.type = visualization_msgs::Marker::LINE_LIST;
+  history_landmark_array_.id = 2;
+  history_landmark_array_.color.r = 0.9;
+  history_landmark_array_.color.g = 0.6;
+  history_landmark_array_.color.b = 0.3;
+  history_landmark_array_.color.a = 1.0;
+  history_landmark_array_.scale.x = 0.01;
+
+  history_global_landmark_array_.ns = "history_frame_landmarks";
+  history_global_landmark_array_.header.frame_id = "map";
+  history_global_landmark_array_.action = visualization_msgs::Marker::ADD;
+  history_global_landmark_array_.type = visualization_msgs::Marker::LINE_LIST;
+  history_global_landmark_array_.id = 3;
+  history_global_landmark_array_.color.r = 0.2;
+  history_global_landmark_array_.color.g = 0.3;
+  history_global_landmark_array_.color.b = 0.9;
+  history_global_landmark_array_.color.a = 1.0;
+  history_global_landmark_array_.scale.x = 0.01;
   return true;
 }
 
@@ -178,7 +235,8 @@ void Node::AddSensorSamplers(const int trajectory_id,
 
 void Node::PublishTrajectoryStates(const ::ros::WallTimerEvent& timer_event) {
   carto::common::MutexLocker lock(&mutex_);
-  for (const auto& entry : map_builder_bridge_.GetTrajectoryStates()) {
+  const auto&& ts = map_builder_bridge_.GetTrajectoryStates();
+  for (const auto& entry : ts) {
     const auto& trajectory_state = entry.second;
 
     auto& extrapolator = extrapolators_.at(entry.first);
@@ -186,18 +244,288 @@ void Node::PublishTrajectoryStates(const ::ros::WallTimerEvent& timer_event) {
     // frequency, and republishing it would be computationally wasteful.
     if (trajectory_state.local_slam_data->time !=
         extrapolator.GetLastPoseTime()) {
-      if (scan_matched_point_cloud_publisher_.getNumSubscribers() > 0) {
+      if (scan_matched_point_cloud_publisher_.getNumSubscribers() > 0 || node_options_.generate_landmark == true) {
         // TODO(gaschler): Consider using other message without time
         // information.
         carto::sensor::TimedPointCloud point_cloud;
         point_cloud.reserve(trajectory_state.local_slam_data
                                 ->range_data_in_local.returns.size());
+        static bool flag_comp = false;
         for (const Eigen::Vector3f point :
              trajectory_state.local_slam_data->range_data_in_local.returns) {
           Eigen::Vector4f point_time;
           point_time << point, 0.f;
           point_cloud.push_back(point_time);
         }
+        auto result = [&trajectory_state, this, &ts]() -> bool {
+            if(trajectory_state.local_slam_data == nullptr)
+            {
+              ROS_ERROR_STREAM("local_slam_data is nullptr");
+              return false;
+            }
+            auto timestamp_laser = ToRos(std::get<1>(latest_pl_));
+            auto timestamp_pl_matched = ToRos(trajectory_state.local_slam_data->time);
+            if(std::abs((timestamp_laser - timestamp_pl_matched).toSec()) <= 0.010)
+            {
+//              ROS_WARN_STREAM("Sync with local");
+              auto& pointcloud = std::get<0>(latest_pl_);
+              size_t point_size = pointcloud.points.size();
+
+              current_landmark_array_.header.stamp = timestamp_laser;
+              history_landmark_array_.header.stamp = timestamp_laser;
+              history_global_landmark_array_.header.stamp = timestamp_laser;
+
+              {
+                if(ts.empty() == true)
+                {
+                  ROS_ERROR_STREAM("TS EMPTY.");
+                  return false;
+                }
+                else
+                {
+                  flag_comp = true;
+                  int trajectory_id = 3;
+                  // auto const& traj_state = map_builder_bridge_.GetTrajectoryStates()[trajectory_id];
+                  if(trajectory_state.local_slam_data == nullptr)
+                  {
+                    ROS_ERROR_STREAM("local_slam_data is nullptr");
+                    return false;
+                  }
+                  auto& local_pose = trajectory_state.local_slam_data->local_pose;
+                  auto& local_to_map = trajectory_state.local_to_map;
+
+                  // // ROS_INFO_STREAM(sensor_to_tracking->cast<float>().DebugString());
+                  // auto& trajectories = this->map_builder_bridge_.map_builder_->pose_graph()->GetTrajectoryNodes().trajectories();
+                  // const auto it = trajectory.data_.find(GetIndex(id));
+
+                  // const auto& trajectory_nodes = this->map_builder_bridge_.map_builder_->pose_graph()->GetTrajectoryNodes();
+                  // const auto& trajectories = trajectory_nodes.trajectories()[0].data_;
+                  if(map_builder_bridge_.map_builder_ == nullptr
+                     || map_builder_bridge_.map_builder_->pose_graph() == nullptr)
+                  {
+                    ROS_ERROR_STREAM("Builder nullptr");
+                    return false;
+                  }
+
+//                  auto traj_lists = map_builder_bridge_.map_builder_->pose_graph()->GetTrajectoryNodes().trajectories_;
+//                  if(traj_lists.empty() == true) return false;
+//                  auto& traj = traj_lists.at(0);
+//
+//                  auto num_traj_nodes = traj.data_.size();
+//                  auto last_traj_node = traj.data_[num_traj_nodes-1];
+//                  if(last_traj_node.constant_data == nullptr) return false;
+//                  auto time_last_node = ToRos(last_traj_node.constant_data->time);
+                  // ROS_INFO_STREAM(local_pose.cast<float>().DebugString());
+                  // ROS_WARN_STREAM("LocalPose(Latest): " << num_traj_nodes);
+                  // ROS_WARN_STREAM("Latest Pose: " << last_traj_node.second.const);
+                  // ROS_WARN_STREAM("Handler------PoseGraph: " << node.map_builder_bridge_.map_builder_->pose_graph()->GetTrajectoryNodes().size());
+
+                  // auto global_pose = last_traj_node.global_pose;
+                  //local_pose.DebugString();
+
+
+                  CHECK_GE(trajectory_id, 0);
+//                  auto trajectory = map_builder_bridge_.map_builder_->pose_graph()->GetTrajectoryNodes().trajectories_[trajectory_id];
+                    auto trajectory = map_builder_bridge_.map_builder_->pose_graph()->GetTrajectoryNodePoses().trajectories_[trajectory_id];
+//                    ROS_ERROR_STREAM("Traj Pose: " << traj_poses.size());
+//                  if(trajectory.can_append_ == false) return false;
+                  const int index = trajectory.data_.empty() ? -1 : trajectory.data_.rbegin()->first;
+//                  ROS_WARN_STREAM("TrajNode idx: " << index);
+//                  if(trajectory.data_.find(index) == trajectory.data_.end())
+
+                  if(index < 0)
+                  {
+                    ROS_WARN_STREAM("No traj node found: " << index);
+                    return false;
+                  }
+                  if(trajectory.data_[index].constant_pose_data.has_value() == false){ return false;}
+//                  auto time_last_node = ToRos(trajectory.data_[index].constant_pose_data.value().time);
+
+                  auto const& sensor_bridge = map_builder_bridge_.sensor_bridge(trajectory_id);
+                  auto const& tf_buf = sensor_bridge->tf_bridge();
+                  std::string laser_frame_id = "laser";
+                  auto sensor_to_tracking = tf_buf.LookupToTracking(std::get<1>(latest_pl_), [](auto& frame_id){
+                      if(frame_id.size() > 0){
+                        CHECK_NE(frame_id[0], '/') << "Should not start with a /.";
+                      }
+                      return frame_id;
+                  }(laser_frame_id));
+
+                  // auto global_result = pointcloud;
+
+                  auto transformed_pointcloud = [&](decltype(pointcloud)& pl_data, decltype(sensor_to_tracking)& stt){
+//                      auto result = pl_data;
+                      cartographer::sensor::PointCloudWithIntensities result;
+                      result.intensities = pl_data.intensities;
+
+                      result.points.clear();
+                      result.points.reserve(pl_data.points.size());
+                      // global_result.points.clear();
+                      // global_result.points.reserve(pl_data.points.size());
+
+                      for(const Eigen::Vector4f& point : pl_data.points)
+                      {
+                        Eigen::Vector4f result_point;
+                        // Eigen::Vector4f result_global_point;
+                        //auto tf_to_map = local_pose * (*stt);
+                        //result_point.head<3>() = stt->cast<float>() * point.head<3>();
+                        result_point.head<3>() = (local_to_map * local_pose * (*stt)).cast<float>() * point.head<3>();
+                        // result_point.head<3>() = (local_pose * (*stt)).cast<float>() * point.head<3>();
+                        result_point[3] = point[3];
+                        result.points.emplace_back(result_point);
+
+                        // result_global_point.head<3>() = (global_pose* local_to_map * (*stt)).cast<float>() * point.head<3>();
+                        // result_global_point[3] = point[3];
+                        // global_result.points.emplace_back(result_global_point);
+                      }
+                      result.intensities = pl_data.intensities;
+                      // global_result.intensities = pl_data.intensities;
+
+                      return result;
+                  }(pointcloud, sensor_to_tracking);
+
+                  static std::vector<Eigen::Vector3f> current_landmarks;
+                  current_landmarks.clear();
+                  current_landmark_array_.points.clear();
+                  for(size_t idx = 0; idx < point_size; ++idx)
+                  {
+                    auto point_stamp = pointcloud.points[idx];
+                    auto point_map_stamp = transformed_pointcloud.points[idx];
+
+                    // auto point_global_stamp = global_result.points[idx];
+
+                    Eigen::Vector3f point(point_stamp[0], point_stamp[1], point_stamp[2]);
+                    Eigen::Vector3f point_map(point_map_stamp[0], point_map_stamp[1], point_map_stamp[2]);
+                    // Eigen::Vector3f point_global(point_global_stamp[0], point_global_stamp[1], point_global_stamp[2]);
+                    if(point.norm() > 0.5 && point.norm() < 12 && std::abs(point[2]) <=0.2)
+                    {
+                      //ROS_ERROR_STREAM("In range.");
+                      if(pointcloud.intensities[idx] > 1400)
+                      {
+                        current_landmarks.emplace_back(point);
+                        tf::Vector3 landmark_point(point_map[0],point_map[1], point_map[2]);
+                        geometry_msgs::PointStamped p_map;
+                        p_map.header.stamp = current_landmark_array_.header.stamp;
+                        p_map.header.frame_id = current_landmark_array_.header.frame_id;
+                        p_map.point.x = landmark_point[0];
+                        p_map.point.y = landmark_point[1];
+                        p_map.point.z = landmark_point[2];
+                        current_landmark_array_.points.emplace_back(p_map.point);
+                        history_landmark_array_.points.emplace_back(p_map.point);
+                        p_map.point.z = 2.0;
+                        current_landmark_array_.points.emplace_back(p_map.point);
+                        history_landmark_array_.points.emplace_back(p_map.point);
+                        //ROS_WARN_STREAM("Detected.");
+                        // if(std::abs((timestamp_laser-time_last_node).toSec()) < 0.012)
+                        // {
+                        //   tf::Vector3 landmark_point_global(point_global[0], point_global[1], point_global[2]);
+                        //   geometry_msgs::PointStamped p_global;
+                        //   p_global.header.stamp = current_landmark_array_.header.stamp;
+                        //   p_global.header.frame_id = current_landmark_array_.header.frame_id;
+                        //   p_global.point.x = landmark_point_global[0];
+                        //   p_global.point.y = landmark_point_global[1];
+                        //   p_global.point.z = landmark_point_global[2];
+                        //   history_global_landmark_array_.points.emplace_back(p_global.point);
+                        //   p_global.point.z = 2.0;
+                        //   history_global_landmark_array_.points.emplace_back(p_global.point);
+                        // }
+                        // else{
+                        //   ROS_ERROR_STREAM("Global Timeout");
+                        // }
+                        //localization_3.bag.fixed_odom.bag
+                      }
+                    }
+                  }
+
+                  landmarks_point_cloud_publisher_.publish(current_landmark_array_);
+                  landmarks_point_cloud_history_publisher_.publish(history_landmark_array_);
+
+//                  landmark_local_.emplace_back(std::make_pair(num_traj_nodes-1, current_landmarks));
+                  landmark_local_with_time_.emplace_back(std::make_tuple(index, timestamp_pl_matched,current_landmarks));
+
+//                  ROS_WARN_STREAM("Publish");
+
+
+                  point_cloud_compare_publisher_.publish(ToPointCloud2Message(
+                          cartographer::common::ToUniversal(trajectory_state.local_slam_data->time),
+                          node_options_.map_frame,
+                          cartographer::sensor::TransformTimedPointCloud(
+                                  pointcloud.points, (trajectory_state.local_to_map * local_pose * (*sensor_to_tracking)).cast<float>())));
+                  // ROS_WARN_STREAM("Sync_Get Laser Timestamp: " << timestamp_laser);
+                  // ROS_ERROR_STREAM("Sync_Pub PCLTime: " << ToRos(trajectory_state.local_slam_data->time));
+                  // static size_t count = 0;
+                  // if(count<10)
+                  // {
+                  //   ++count;
+                  //   ROS_WARN_STREAM("Count: " << count);
+                  // }
+                  // else
+                  // {
+                  //   count = 0;
+                  if(flag_comp == true)
+                  {
+                    history_global_landmark_array_.points.clear();
+//                    ROS_INFO_STREAM("Global Size: " << landmark_local_with_time_.size());
+                    for(auto& landmark_pair:landmark_local_with_time_)
+                    {
+                      auto& node_idx = std::get<0>(landmark_pair);
+                      auto& time_stamp = std::get<1>(landmark_pair);
+                      auto& landmarks = std::get<2>(landmark_pair);
+
+                      if(node_idx > index) continue;
+//                      if(trajectory.can_append_ == false) continue;
+//                      if(trajectory.data_.find(node_idx) == trajectory.data_.end()) continue;
+//                      if(trajectory.data_[node_idx].constant_pose_data == nullptr) continue;
+                        if(trajectory.data_[node_idx].constant_pose_data.has_value() == false){ ROS_ERROR_STREAM("NO VALUE!!!");continue;}
+                        auto traj_time = ToRos(trajectory.data_[node_idx].constant_pose_data.value().time);
+//                        ROS_ERROR_STREAM("tmp_timestamp: " << (time_stamp).toSec());
+//                        ROS_ERROR_STREAM("traj_timestamp: " << (traj_time).toSec());
+                      if(std::abs((time_stamp-traj_time).toSec()) >= 0.010) { /*ROS_ERROR_STREAM("Timeout: " << (time_stamp-traj_time).toSec());*/ continue;}
+                      // auto node_global_pose = trajectories[node_idx].constant_data->local_pose;
+                      auto& node_global_pose = trajectory.data_[node_idx].global_pose;
+//                       ROS_WARN_STREAM("Update Global");
+                      for(const Eigen::Vector3f& landmark_laser:landmarks)
+                      {
+                        Eigen::Vector3f global_lm = (node_global_pose * (*sensor_to_tracking)).cast<float>() * landmark_laser;
+
+                        tf::Vector3 landmark_point_global(global_lm[0], global_lm[1], global_lm[2]);
+                        geometry_msgs::PointStamped p_global;
+                        p_global.header.stamp = current_landmark_array_.header.stamp;
+                        p_global.header.frame_id = current_landmark_array_.header.frame_id;
+                        p_global.point.x = landmark_point_global[0];
+                        p_global.point.y = landmark_point_global[1];
+                        p_global.point.z = landmark_point_global[2];
+                        history_global_landmark_array_.points.emplace_back(p_global.point);
+                        p_global.point.z = 2.0;
+                        history_global_landmark_array_.points.emplace_back(p_global.point);
+                      }
+                      flag_comp = false;
+                    }
+                    landmarks_point_cloud_global_history_publisher_.publish(history_global_landmark_array_);
+
+                  }
+                }
+              }
+            }//END
+            return true;
+        }();
+        // else
+        // {
+        //    cartographer::common::MutexLocker lock(&mutex_pl_);
+        //    ROS_ERROR_STREAM("DROP, TIMEOUT; Diff: " << (timestamp_laser-timestamp_pl_matched).toSec());
+        //    ROS_ERROR_STREAM("Size: " << buff_pl_.size());
+        //    for(auto& pl: buff_pl_)
+        //    {
+        //      auto buff_timestamp = ToRos(std::get<1>(pl));
+        //      if(buff_timestamp == timestamp_pl_matched)
+        //      {
+        //        ROS_WARN_STREAM("Found!!!!!!!!!!!!!!!!!!!");
+        //      }
+        //      ROS_WARN_STREAM("DROP, TIMEOUT; Diff: " << (buff_timestamp-timestamp_pl_matched).toSec());
+        //    }
+        // }
+
+
         scan_matched_point_cloud_publisher_.publish(ToPointCloud2Message(
             carto::common::ToUniversal(trajectory_state.local_slam_data->time),
             node_options_.map_frame,
@@ -440,6 +768,52 @@ bool Node::ValidateTopicNames(
     }
   }
   return true;
+}
+
+void Node::saveLandmarks(const std::string& save_path)
+{
+    std::ofstream landmark_hd;
+    landmark_hd.open(save_path);
+      auto trajectory = map_builder_bridge_.map_builder_->pose_graph()->GetTrajectoryNodePoses().trajectories_[0];
+    const int index = trajectory.data_.empty() ? -1 : trajectory.data_.rbegin()->first;
+
+    if(index < 0)
+    {
+        ROS_WARN_STREAM("No traj node found: " << index);
+        exit(1);
+    }
+    auto const& sensor_bridge = map_builder_bridge_.sensor_bridge(3);
+    auto const& tf_buf = sensor_bridge->tf_bridge();
+    std::string laser_frame_id = "laser";
+    auto sensor_to_tracking = tf_buf.LookupToTracking(std::get<1>(latest_pl_), [](auto& frame_id){
+        if(frame_id.size() > 0){
+            CHECK_NE(frame_id[0], '/') << "Should not start with a /.";
+        }
+        return frame_id;
+    }(laser_frame_id));
+    size_t size_landmark = 0;
+    for(auto& landmark_pair:landmark_local_with_time_)
+    {
+        auto& node_idx = std::get<0>(landmark_pair);
+        auto& time_stamp = std::get<1>(landmark_pair);
+        auto& landmarks = std::get<2>(landmark_pair);
+
+        if(node_idx > index) continue;
+        if(trajectory.data_[node_idx].constant_pose_data.has_value() == false){ ROS_ERROR_STREAM("NO VALUE!!!");continue;}
+        auto traj_time = ToRos(trajectory.data_[node_idx].constant_pose_data.value().time);
+        if(std::abs((time_stamp-traj_time).toSec()) >= 0.010) { /*ROS_ERROR_STREAM("Timeout: " << (time_stamp-traj_time).toSec());*/ continue;}
+        auto& node_global_pose = trajectory.data_[node_idx].global_pose;
+        size_landmark += landmarks.size();
+        for(const Eigen::Vector3f& landmark_laser:landmarks)
+        {
+            Eigen::Vector3f global_lm = (node_global_pose * (*sensor_to_tracking)).cast<float>() * landmark_laser;
+
+//            tf::Vector3 landmark_point_global(global_lm[0], global_lm[1], global_lm[2]);
+            landmark_hd << global_lm[0] << " " << global_lm[1] << " " << global_lm[2] << std::endl;
+        }
+    }
+    landmark_hd.close();
+    ROS_WARN_STREAM("Landmarks saved, in total " << size_landmark << ". Saved at " << save_path);
 }
 
 cartographer_ros_msgs::StatusResponse Node::FinishTrajectoryUnderLock(

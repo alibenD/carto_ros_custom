@@ -127,6 +127,7 @@ int MapBuilderBridge::AddTrajectory(
                   ::std::placeholders::_1, ::std::placeholders::_2,
                   ::std::placeholders::_3, ::std::placeholders::_4,
                   ::std::placeholders::_5));
+  build_traj_id_ = trajectory_id;
   LOG(INFO) << "Added trajectory with ID '" << trajectory_id << "'.";
 
   // Make sure there is no trajectory with 'trajectory_id' yet.

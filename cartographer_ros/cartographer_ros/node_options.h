@@ -35,6 +35,7 @@ struct NodeOptions {
   double submap_publish_period_sec;
   double pose_publish_period_sec;
   double trajectory_publish_period_sec;
+  bool generate_landmark;
 };
 
 NodeOptions CreateNodeOptions(
